@@ -1,10 +1,14 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
 import "./EventFactory.sol";
+import "./Base64.sol";
 
-contract EventTicketing is ERC721, ReentrancyGuard {
+contract EventTicketing is ERC721URIStorage, ReentrancyGuard, Ownable {
     struct Ticket {
         uint256 eventId;
         uint256 ticketNumber;
@@ -27,22 +31,18 @@ contract EventTicketing is ERC721, ReentrancyGuard {
     event TicketListedForSale(uint256 indexed ticketId, uint256 price);
     event TicketSold(uint256 indexed ticketId, address indexed buyer, uint256 price);
     event TicketRefunded(uint256 indexed ticketId);
+    event BaseURIUpdated(string oldBaseURI, string newBaseURI);
 
-    constructor(address _eventFactory) ERC721("Event Ticket", "TCKT") {
+    constructor(address _eventFactory) 
+        ERC721("Event Ticket", "TCKT") 
+        Ownable(msg.sender) 
+    {
         eventFactory = EventFactory(_eventFactory);
     }
 
-    function updateBaseURI(string memory _baseURI) external onlyOwner {
-        baseURI = _baseURI;
-    }
-
-    function _baseURI() internal view override returns (string memory) {
-        return baseURI;
-    }
-
-    function tokenURI(uint256 tokenId) public view override returns (string memory) {
-        require(_exists(tokenId), "Token does not exist");
-        return string(abi.encodePacked(baseURI, Strings.toString(tokenId), ".json"));
+    function updateTicketBaseURI(string memory newBaseURI) external onlyOwner {
+        emit BaseURIUpdated(baseURI, newBaseURI);
+        baseURI = newBaseURI;
     }
 
     function mintTicket(uint256 _eventId) external payable nonReentrant returns (uint256) {
@@ -73,57 +73,60 @@ contract EventTicketing is ERC721, ReentrancyGuard {
         return ticketId;
     }
 
-    function listTicketForSale(uint256 _ticketId, uint256 _price) external {
-        require(ownerOf(_ticketId) == msg.sender, "Not ticket owner");
-        Ticket storage ticket = tickets[_ticketId];
-        EventFactory.Event memory event_ = eventFactory.getEvent(ticket.eventId);
-
-        require(event_.allowsResale, "Resale not allowed");
-        require(_price <= event_.maxResalePrice, "Price exceeds max");
-        require(!ticket.used, "Ticket used");
-        require(block.timestamp < event_.startTime, "Event started");
-
-        ticket.forSale = true;
-        ticket.resalePrice = _price;
-        emit TicketListedForSale(_ticketId, _price);
-    }
-
-    function buyResaleTicket(uint256 _ticketId) external payable nonReentrant {
-        Ticket storage ticket = tickets[_ticketId];
-        require(ticket.forSale, "Not for sale");
-        require(msg.value >= ticket.resalePrice, "Insufficient payment");
-
-        address seller = ownerOf(_ticketId);
-        ticket.forSale = false;
-
-        _transfer(seller, msg.sender, _ticketId);
-        payable(seller).transfer(ticket.resalePrice);
-
-        if (msg.value > ticket.resalePrice) {
-            payable(msg.sender).transfer(msg.value - ticket.resalePrice);
-        }
-
-        emit TicketSold(_ticketId, msg.sender, ticket.resalePrice);
-    }
-
     function refundTicket(uint256 _ticketId) external nonReentrant {
         require(ownerOf(_ticketId) == msg.sender, "Not ticket owner");
+        
         Ticket storage ticket = tickets[_ticketId];
+        require(!ticket.used, "Ticket already used");
+        
+        EventFactory.Event memory event_ = eventFactory.getEvent(ticket.eventId);
+        require(!event_.cancelled, "Event already cancelled");
+        require(block.timestamp < event_.startTime, "Event already started");
+        
+        uint256 refundAmount = ticket.purchasePrice;
+        
+        // Burn the ticket first
+        _burn(_ticketId);
+        
+        // Then send the refund
+        payable(msg.sender).transfer(refundAmount);
+        
+        emit TicketRefunded(_ticketId);
+    }
+
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        try this.ownerOf(tokenId) returns (address owner) {
+            require(owner != address(0), "Token does not exist");
+        } catch {
+            revert("Token does not exist");
+        }
+
+        Ticket memory ticket = tickets[tokenId];
         EventFactory.Event memory event_ = eventFactory.getEvent(ticket.eventId);
 
-        require(!ticket.used, "Ticket used");
-        require(block.timestamp < event_.startTime, "Event started");
-        require(block.timestamp <= ticket.purchaseTime + event_.refundWindow, "Refund window closed");
+        string memory metadata = string(
+            abi.encodePacked(
+                '{"name":"Event Ticket #', Strings.toString(ticket.ticketNumber),
+                '","description":"Ticket for Event #', Strings.toString(ticket.eventId),
+                '","attributes":[{"trait_type":"Event ID","value":', Strings.toString(ticket.eventId),
+                '},{"trait_type":"Used","value":', ticket.used ? "true" : "false",
+                '},{"trait_type":"Purchase Price","value":', Strings.toString(ticket.purchasePrice),
+                '}]}'
+            )
+        );
 
-        ticket.used = true;
-        _burn(_ticketId);
-        payable(msg.sender).transfer(ticket.purchasePrice);
-
-        emit TicketRefunded(_ticketId);
+        return string(
+            abi.encodePacked(
+                baseURI,
+                "data:application/json;base64,",
+                Base64.encode(bytes(metadata))
+            )
+        );
     }
 
     function useTicket(uint256 _ticketId) external {
         require(ownerOf(_ticketId) == msg.sender, "Not ticket owner");
+
         Ticket storage ticket = tickets[_ticketId];
         require(!ticket.used, "Ticket already used");
 
@@ -134,5 +137,46 @@ contract EventTicketing is ERC721, ReentrancyGuard {
 
         ticket.used = true;
         emit TicketUsed(_ticketId);
+    }
+
+    function listTicketForSale(uint256 _ticketId, uint256 _price) external {
+        require(ownerOf(_ticketId) == msg.sender, "Not ticket owner");
+        
+        Ticket storage ticket = tickets[_ticketId];
+        require(!ticket.used, "Ticket already used");
+
+        EventFactory.Event memory event_ = eventFactory.getEvent(ticket.eventId);
+        require(_price <= event_.maxResalePrice, "Price above max resale price");
+        
+        ticket.forSale = true;
+        ticket.resalePrice = _price;
+
+        emit TicketListedForSale(_ticketId, _price);
+    }
+
+    function buyTicket(uint256 _ticketId) external payable nonReentrant {
+        Ticket storage ticket = tickets[_ticketId];
+        require(ticket.forSale, "Ticket not for sale");
+        require(msg.value >= ticket.resalePrice, "Insufficient payment");
+
+        address previousOwner = ownerOf(_ticketId);
+        address newOwner = msg.sender;
+
+        _transfer(previousOwner, newOwner, _ticketId);
+
+        payable(previousOwner).transfer(msg.value);
+
+        ticket.forSale = false;
+        ticket.resalePrice = 0;
+
+        emit TicketSold(_ticketId, newOwner, msg.value);
+    }
+
+    function checkTokenExists(uint256 tokenId) internal view returns (bool) {
+        try this.ownerOf(tokenId) returns (address owner) {
+            return owner != address(0);
+        } catch {
+            return false;
+        }
     }
 }

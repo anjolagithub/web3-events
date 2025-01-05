@@ -112,8 +112,8 @@ contract EventPlatformTest is Test {
         // Buy resale ticket
         vm.startPrank(attendee);
         vm.deal(attendee, 2 ether);
-        ticketing.buyResaleTicket{value: 1.5 ether}(ticketId);
-
+        ticketing.buyTicket{value: 1.5 ether}(ticketId); // Updated function name from buyResaleTicket to buyTicket
+        
         assertEq(ticketing.ownerOf(ticketId), attendee);
         vm.stopPrank();
     }
